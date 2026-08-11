@@ -12,24 +12,38 @@ import { canReuseSessionKey, singleFlight } from "../src/console/SealCryptoServi
  */
 
 const ADDR = "0xabc";
-const fresh = { address: ADDR, sessionKey: { isExpired: () => false } };
-const expired = { address: ADDR, sessionKey: { isExpired: () => true } };
+const PKG = "0xpackage";
+const TTL = 10;
+const WANT = { address: ADDR, packageId: PKG, ttlMin: TTL };
+const fresh = { ...WANT, sessionKey: { isExpired: () => false } };
+const expired = { ...WANT, sessionKey: { isExpired: () => true } };
 
 describe("canReuseSessionKey", () => {
   it("returns false when there is no cached key", () => {
-    expect(canReuseSessionKey(undefined, ADDR)).toBe(false);
+    expect(canReuseSessionKey(undefined, WANT)).toBe(false);
   });
 
-  it("returns true for a matching address that is not expired", () => {
-    expect(canReuseSessionKey(fresh, ADDR)).toBe(true);
+  it("returns true for matching parameters that are not expired", () => {
+    expect(canReuseSessionKey(fresh, WANT)).toBe(true);
   });
 
   it("returns false when the cached key has expired", () => {
-    expect(canReuseSessionKey(expired, ADDR)).toBe(false);
+    expect(canReuseSessionKey(expired, WANT)).toBe(false);
   });
 
   it("returns false when the signer address differs", () => {
-    expect(canReuseSessionKey(fresh, "0xdifferent")).toBe(false);
+    expect(canReuseSessionKey(fresh, { ...WANT, address: "0xdifferent" })).toBe(false);
+  });
+
+  // A key is bound to the package it was created for, so handing one back to a
+  // caller asking about a different package would be a cross-package reuse.
+  it("returns false when the package id differs", () => {
+    expect(canReuseSessionKey(fresh, { ...WANT, packageId: "0xother" })).toBe(false);
+  });
+
+  // A cached 10-minute key does not satisfy a caller that asked for 60.
+  it("returns false when the requested ttl differs", () => {
+    expect(canReuseSessionKey(fresh, { ...WANT, ttlMin: 60 })).toBe(false);
   });
 });
 

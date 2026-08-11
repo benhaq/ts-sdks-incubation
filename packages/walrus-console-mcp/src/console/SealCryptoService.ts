@@ -2,7 +2,6 @@ import { EncryptedObject, SealClient, SessionKey } from "@mysten/seal";
 import { decodeSuiPrivateKey } from "@mysten/sui/cryptography";
 import { SuiGrpcClient } from "@mysten/sui/grpc";
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
-import { Transaction } from "@mysten/sui/transactions";
 import { fromBase64, fromHex } from "@mysten/sui/utils";
 import { Effect } from "effect";
 
@@ -12,15 +11,10 @@ import {
   getRawAdminServiceKey,
   getRawServiceKey,
 } from "../config";
-import {
-  CONSOLE_LATEST_PACKAGE_ID,
-  CONSOLE_ORIGINAL_PACKAGE_ID,
-  SEAL_KEY_SERVER_OBJECT_IDS,
-  SealIdentity,
-  type SealIdentityInput,
-  SUI_TESTNET_FULLNODE,
-} from "./constants";
+import { SEAL_KEY_SERVER_OBJECT_IDS, SealIdentity, type SealIdentityInput } from "./constants";
 import { SealCryptoError } from "./errors";
+import { resolveFullnodeUrl, resolvePackageConfig, resolveSuiNetwork } from "./packageConfig";
+import { buildSealApproveTransaction } from "./sealApprove";
 
 /**
  * SealCryptoService — the heart of private (encrypted) Console operations.
@@ -32,19 +26,52 @@ import { SealCryptoError } from "./errors";
  * Pattern: exact match to console/api Effect v3 services (CLAUDE.md).
  */
 
-/** A cached SessionKey together with the signer address it was created for. */
-interface CachedSessionKey {
+/**
+ * Lifetime of a Seal SessionKey, in minutes. Long enough that a multi-file
+ * download reuses one registration, short enough to bound the window in which a
+ * leaked session certificate is usable.
+ */
+const SESSION_KEY_TTL_MIN = 10;
+
+/**
+ * Every input to `SessionKey.create` that a cached key must agree on to be
+ * reusable. Grouped into a record rather than passed as loose arguments so the
+ * same literal builds the create call and the cache entry, and so `address` and
+ * `packageId` — two adjacent strings — cannot be silently transposed.
+ */
+interface SessionKeyParams {
   readonly address: string;
+  readonly packageId: string;
+  readonly ttlMin: number;
+}
+
+/** A cached SessionKey together with the parameters it was created for. */
+interface CachedSessionKey extends SessionKeyParams {
   readonly sessionKey: { isExpired(): boolean };
 }
 
 /**
- * True when a cached Seal SessionKey may be reused for `address`: it exists, was
- * created for the same signer, and has not expired (the SDK's `isExpired()`
+ * True when a cached Seal SessionKey may be reused for `want`: it exists, every
+ * creation parameter matches, and it has not expired (the SDK's `isExpired()`
  * already applies a ~10s safety margin). Pure, so it is unit-tested directly.
+ *
+ * Comparing the whole of `want` rather than the address alone matters now that
+ * `packageId` is resolved per Console base URL (COMG-601) rather than being a
+ * module constant: an address-keyed cache would hand a key created against one
+ * network's package to a caller asking about another's. The key servers would
+ * reject it, so this fails closed either way — but it fails far from its cause.
  */
-export function canReuseSessionKey(cached: CachedSessionKey | undefined, address: string): boolean {
-  return cached !== undefined && cached.address === address && !cached.sessionKey.isExpired();
+export function canReuseSessionKey(
+  cached: CachedSessionKey | undefined,
+  want: SessionKeyParams,
+): boolean {
+  return (
+    cached !== undefined &&
+    cached.address === want.address &&
+    cached.packageId === want.packageId &&
+    cached.ttlMin === want.ttlMin &&
+    !cached.sessionKey.isExpired()
+  );
 }
 
 /**
@@ -148,14 +175,19 @@ export class SealCryptoService extends Effect.Service<SealCryptoService>()("Seal
       }
     });
 
+    // The network follows the Console API the MCP is pointed at, so the on-chain
+    // identifiers can never disagree with the backend serving the buckets.
+    const network = resolveSuiNetwork(config.baseUrl);
+    const packageConfig = resolvePackageConfig(network);
+
     // SuiGrpcClient + SealClient are stateless config holders (no network I/O until a
     // call is made), so build them once per runtime instead of per encrypt/decrypt. The
     // keypair stays lazy (getKeypair) so a missing service key never fails runtime startup.
-    // gRPC is the recommended transport (JSON-RPC is deprecated); the fullnode serves both
-    // over the same host:port, so SUI_TESTNET_FULLNODE doubles as the gRPC baseUrl.
+    // gRPC is the recommended transport (JSON-RPC is retired on public fullnodes); the
+    // fullnode serves both over the same host:port.
     const suiClient = new SuiGrpcClient({
-      baseUrl: SUI_TESTNET_FULLNODE,
-      network: "testnet",
+      baseUrl: resolveFullnodeUrl(network),
+      network,
     });
 
     const sealClient = new SealClient({
@@ -169,30 +201,32 @@ export class SealCryptoService extends Effect.Service<SealCryptoService>()("Seal
 
     // SessionKey.create performs a network round-trip (a getObject RPC to assert
     // the package version) plus a signature every call. It is valid for its full
-    // ttlMin window, so cache it per signer address and recreate only on expiry —
-    // downloading N files no longer means N redundant session registrations.
+    // ttlMin window, so cache it per creation parameter set and recreate only on
+    // expiry — downloading N files no longer means N redundant registrations.
     // The create is single-flighted, so N *concurrent* cold callers also share
     // one registration rather than racing to create one each.
-    let cachedSessionKey: { address: string; sessionKey: SessionKey } | undefined;
+    let cachedSessionKey: (SessionKeyParams & { sessionKey: SessionKey }) | undefined;
     const sessionKeyLock = yield* Effect.makeSemaphore(1);
 
     const getSessionKey = Effect.fn("SealCryptoService.getSessionKey")(function* (
       keypair: Ed25519Keypair,
     ) {
-      const address = keypair.toSuiAddress();
+      // One record drives all three uses — the reuse check, the create call, and
+      // the cache entry — so they cannot drift apart.
+      const params: SessionKeyParams = {
+        address: keypair.toSuiAddress(),
+        packageId: packageConfig.originalPackageId,
+        ttlMin: SESSION_KEY_TTL_MIN,
+      };
       return yield* singleFlight(
         sessionKeyLock,
         () =>
-          canReuseSessionKey(cachedSessionKey, address)
-            ? (cachedSessionKey as { address: string; sessionKey: SessionKey }).sessionKey
-            : undefined,
+          canReuseSessionKey(cachedSessionKey, params) ? cachedSessionKey?.sessionKey : undefined,
         Effect.gen(function* () {
           const sessionKey = yield* Effect.tryPromise({
             try: () =>
               SessionKey.create({
-                address,
-                packageId: CONSOLE_ORIGINAL_PACKAGE_ID,
-                ttlMin: 10,
+                ...params,
                 suiClient,
                 signer: keypair,
               }),
@@ -203,7 +237,7 @@ export class SealCryptoService extends Effect.Service<SealCryptoService>()("Seal
                 step: "session_key",
               }),
           });
-          cachedSessionKey = { address, sessionKey };
+          cachedSessionKey = { ...params, sessionKey };
           return sessionKey;
         }),
       );
@@ -232,7 +266,7 @@ export class SealCryptoService extends Effect.Service<SealCryptoService>()("Seal
         try: () =>
           sealClient.encrypt({
             threshold: 2,
-            packageId: CONSOLE_ORIGINAL_PACKAGE_ID,
+            packageId: packageConfig.originalPackageId,
             id,
             data: plaintext,
           }),
@@ -276,14 +310,7 @@ export class SealCryptoService extends Effect.Service<SealCryptoService>()("Seal
       // Build the access-check transaction kind (never broadcast). Construction is
       // synchronous and can throw; the build itself is async.
       const tx = yield* Effect.try({
-        try: () => {
-          const t = new Transaction();
-          t.moveCall({
-            target: `${CONSOLE_LATEST_PACKAGE_ID}::bucket_policy::seal_approve`,
-            arguments: [t.pure.vector("u8", Array.from(idBytes)), t.object(sealPolicyId)],
-          });
-          return t;
-        },
+        try: () => buildSealApproveTransaction(packageConfig, idBytes, sealPolicyId),
         catch: (cause) =>
           new SealCryptoError({
             message: "Failed to build seal_approve PTB",
@@ -302,7 +329,8 @@ export class SealCryptoService extends Effect.Service<SealCryptoService>()("Seal
           }),
       });
 
-      // SessionKey lets Seal key servers verify the caller (cached per address).
+      // SessionKey lets Seal key servers verify the caller (cached per address,
+      // package and ttl; concurrent cold callers share one registration).
       const sessionKey = yield* getSessionKey(keypair);
 
       const plaintext = yield* Effect.tryPromise({
@@ -310,8 +338,10 @@ export class SealCryptoService extends Effect.Service<SealCryptoService>()("Seal
         catch: (cause) =>
           new SealCryptoError({
             message:
-              "Seal decryption failed. A common cause: CONSOLE_SERVICE_PRIVATE_KEY is not " +
-              "the signer registered for CONSOLE_API_KEY.",
+              "Seal decryption failed. Common causes: CONSOLE_SERVICE_PRIVATE_KEY is not " +
+              "the signer registered for CONSOLE_API_KEY, or this build's bucket-policy " +
+              "package identifiers are stale relative to the deployed contract — the key " +
+              "servers evaluate seal_approve, so a version-gate abort surfaces here.",
             cause,
             step: "decrypt",
           }),

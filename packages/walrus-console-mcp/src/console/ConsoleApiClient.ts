@@ -381,17 +381,21 @@ export class ConsoleApiClient extends Effect.Service<ConsoleApiClient>()("Consol
 
     const uploadBucketFile = Effect.fn("ConsoleApiClient.uploadBucketFile")(function* (
       bucketId: BucketId,
-      fileBytes: Uint8Array,
+      // `Uint8Array<ArrayBuffer>`, not a bare `Uint8Array`: @types/node widens the
+      // latter to `Uint8Array<ArrayBufferLike>`, which BlobPart rejects because the
+      // buffer could be a SharedArrayBuffer. Stating the requirement on the
+      // parameter puts it where it is already satisfied — Seal's encrypt() returns
+      // exactly this type — instead of erasing it here by copying every encrypted
+      // file. A caller handing over `fs.readFile` output now fails to compile,
+      // which is the honest answer: Buffer's `.slice()` is `subarray()` and would
+      // not have produced the unshared buffer the old comment claimed anyway.
+      fileBytes: Uint8Array<ArrayBuffer>,
       fileName: string,
       metadata?: Record<string, unknown>,
     ) {
       // Pragmatic multipart using native fetch (reliable for MCP use case)
       const form = new FormData();
-      // `.slice()` rather than a cast: from @types/node 22 on, a bare Uint8Array
-      // is Uint8Array<ArrayBufferLike>, which BlobPart rejects because the buffer
-      // could be a SharedArrayBuffer. slice() copies into a plain ArrayBuffer and
-      // narrows the type honestly, where a cast would only silence the checker.
-      const blob = new Blob([fileBytes.slice()], { type: contentTypeFromName(fileName) });
+      const blob = new Blob([fileBytes], { type: contentTypeFromName(fileName) });
       form.append("file", blob, fileName);
       if (metadata) {
         form.append("metadata", JSON.stringify(metadata));

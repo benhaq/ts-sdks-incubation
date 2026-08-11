@@ -114,13 +114,28 @@ export function allowedDirsFromEnv(env: NodeJS.ProcessEnv = process.env): string
  * path be told apart from a DANGLING symlink — the two are indistinguishable
  * from `realpathSync`'s error alone. The target is read only to name it in the
  * rejection message; nothing resolves through it.
+ *
+ * Note the `catch` carries two meanings, not one — see the comment on it before
+ * reading the caller's walk-up as exhaustively safe.
  */
 function readLinkTarget(p: string): string | undefined {
   try {
     if (!lstatSync(p).isSymbolicLink()) return undefined;
     return readlinkSync(p);
   } catch {
-    return undefined; // does not exist at all, or unreadable — caller walks up
+    // Two different states, deliberately given the same answer: the path does
+    // not exist at all, or it cannot be stat'ed (EACCES). Both report "not a
+    // symlink" and the caller walks up, re-appending the segment lexically —
+    // structurally the same shape as the dangling-link bug this file guards.
+    //
+    // Sound for EACCES because of what lstat needs: search permission on the
+    // PARENT, not on the path itself. If that is denied here, the eventual
+    // writeFile through the same parent is denied too. So the walk-up can hand
+    // back a lexical path that passes containment, but nothing can ever be
+    // written through it — the failure is closed rather than an escape.
+    // Confirmed against a fixture: an out-of-sandbox symlink inside a 000
+    // directory is approved by the check and then refused EACCES by the write.
+    return undefined;
   }
 }
 

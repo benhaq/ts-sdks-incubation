@@ -34,9 +34,9 @@ export const SECRET_ENV_VARS = [
 ] as const;
 
 /**
- * Values shorter than this are ignored when registering. A short or empty
- * "secret" (e.g. an unset var defaulting to "") would otherwise match common
- * substrings and redact half the output. Real Console keys are far longer.
+ * Values whose trimmed length is below this are ignored when registering. A short
+ * or empty "secret" (e.g. an unset var defaulting to "") would otherwise match
+ * common substrings and redact half the output. Real Console keys are far longer.
  */
 const MIN_SECRET_LENGTH = 8;
 
@@ -44,11 +44,26 @@ export const REDACTION_PLACEHOLDER = "«redacted»";
 
 const secrets = new Set<string>();
 
-/** Register a single secret value. No-ops for empty/short/non-string input. */
+/**
+ * Register a single secret value. No-ops for empty/short/non-string input.
+ *
+ * The TRIMMED form is what gets registered, because it is what reaches the wire:
+ * `resolvedString` (src/config.ts) trims the resolved credential before it
+ * becomes an `Authorization: Bearer` header, while the env var and the config
+ * file are read untrimmed. Registering the padded form would therefore watch for
+ * a string that never appears while the real credential passed through unredacted.
+ * Registering only the trimmed form is enough — a padded value contains it, and
+ * `redactString` matches on substrings, so the secret body is caught either way.
+ *
+ * Measuring the length after trimming also keeps a whitespace-only value out of
+ * the set. Eight spaces would otherwise register as a "secret" and scrub that run
+ * of whitespace from every line of output.
+ */
 export function registerSecret(value: unknown): void {
-  if (typeof value === "string" && value.length >= MIN_SECRET_LENGTH) {
-    secrets.add(value);
-  }
+  if (typeof value !== "string") return;
+  const trimmed = value.trim();
+  if (trimmed.length < MIN_SECRET_LENGTH) return;
+  secrets.add(trimmed);
 }
 
 /** Register every known secret env var from the given environment (default: process.env). */

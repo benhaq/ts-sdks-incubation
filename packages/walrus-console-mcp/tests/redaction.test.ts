@@ -45,6 +45,24 @@ describe("registerSecret", () => {
     registerSecret(API_KEY);
     expect(redactString("nothing secret here")).toBe("nothing secret here");
   });
+
+  // Regression: config.ts trims the credential before it becomes a Bearer header,
+  // but the env var and the config file are read untrimmed. Registering the padded
+  // form would watch for a string that never appears on the wire.
+  it("registers the trimmed form, which is what reaches the wire", () => {
+    registerSecret(`  ${API_KEY}\n`);
+    expect(redactString(`token=${API_KEY} done`)).toBe(`token=${REDACTION_PLACEHOLDER} done`);
+  });
+
+  // Regression: the length check runs after trimming, so a run of spaces cannot
+  // register and scrub whitespace out of every line of output. The indented line
+  // below is the giveaway — an unset var defaulting to blank padding would turn
+  // every aligned log line into a placeholder.
+  it("ignores a whitespace-only value even when it is long enough untrimmed", () => {
+    registerSecret(" ".repeat(12));
+    const aligned = `key:${" ".repeat(12)}value`;
+    expect(redactString(aligned)).toBe(aligned);
+  });
 });
 
 describe("registerSecretsFromEnv", () => {
